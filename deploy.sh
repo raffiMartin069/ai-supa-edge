@@ -1,6 +1,7 @@
-#!/bin/bash
-
-set -e
-
-# Deploy the Supabase Edge Functions
-supabase functions deploy assistant-api --project-ref your-project-ref
+# deploy sequentially, abort on the first failure
+for d in functions/*; do
+  [ -d "$d" ] || continue
+  name="$(basename "$d")"
+  echo "=== Deploying function: $name ==="
+  supabase functions deploy "$name" || { echo "Deploy failed for $name"; exit 1; }
+done

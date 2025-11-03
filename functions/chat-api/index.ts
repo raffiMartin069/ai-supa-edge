@@ -44,17 +44,43 @@ Deno.serve(async (req: Request) => {
 			console.error("[chat-api] embedding-api returned no data", embedResp);
 			return new Response(JSON.stringify({ error: "Embedding service returned no data" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
 		}
-		const queryEmbedding = embedResp.data;
+				// Normalize embedding shape: embedding-api may return a JSON string, a nested array [[...]], or [...]
+				let queryEmbedding: unknown = embedResp.data;
+				if (typeof queryEmbedding === "string") {
+					try {
+						queryEmbedding = JSON.parse(queryEmbedding as string);
+					} catch (err) {
+						console.warn("[chat-api] failed to parse embedding string", { err });
+					}
+				}
+				// If it's nested like [[...]] take the first element
+						if (Array.isArray(queryEmbedding) && Array.isArray((queryEmbedding as unknown[])[0] as unknown[])) {
+							queryEmbedding = ((queryEmbedding as unknown[])[0] as unknown[]);
+						}
 
-		// 2) Query DB for matches
-		const { data: matches, error: rpcErr } = await supabase.rpc("match_faq_entries", { query_embedding: queryEmbedding, match_threshold: 0.75, match_count: 3 });
+						if (!Array.isArray(queryEmbedding) || typeof (queryEmbedding as unknown[])[0] !== "number") {
+							console.error("[chat-api] embedding has unexpected shape", { example: queryEmbedding });
+							return new Response(JSON.stringify({ error: "Invalid embedding shape from embedding-api" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+						}
+
+						console.info("[chat-api] embedding ready", { length: (queryEmbedding as unknown[]).length });
+
+				// 2) Query DB for matches
+				const { data: matches, error: rpcErr } = await supabase.rpc("match_faq_entries", { query_embedding: queryEmbedding, match_threshold: 0.75, match_count: 3 });
 		if (rpcErr) {
 			console.error("[chat-api] match_faq_entries rpc error", rpcErr);
 			return new Response(JSON.stringify({ error: "Failed to fetch matching FAQ entries" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
 		}
 
-		const matchRows = Array.isArray(matches) ? matches : [];
-		const context = matchRows.map((m: any) => `${m.question}\n${m.answer}`).join("\n\n");
+				const matchRows = Array.isArray(matches) ? (matches as unknown[]) : [];
+				const context = matchRows
+					.map((m: unknown) => {
+						const row = m as Record<string, unknown>;
+						const q = typeof row.question === "string" ? row.question : String(row.question ?? "");
+						const a = typeof row.answer === "string" ? row.answer : String(row.answer ?? "");
+						return `${q}\n${a}`;
+					})
+					.join("\n\n");
 
 		// 3) Forward query+context to assistant-api function
 		console.info("[chat-api] calling assistant-api", { matches: matchRows.length, contextLength: context.length });
@@ -75,8 +101,8 @@ Deno.serve(async (req: Request) => {
 		}
 
 		return new Response(JSON.stringify({ reply }), { headers: { "Content-Type": "application/json", ...corsHeaders } });
-	} catch (err: any) {
+	} catch (err: unknown) {
 		console.error("[chat-api] unexpected error", err);
-		return new Response(JSON.stringify({ error: err?.message ?? String(err) }), { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } });
+		return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } });
 	}
 });
