@@ -1,18 +1,5 @@
-// Setup type definitions for built-in Supabase Runtime APIs
+// Minimal assistant-api: simplified prompt, no language support, no constraints
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
-/**
- * Assistant API
- * - Receives { data: { query, context, matches } }
- * - Builds the assistant prompt (Barangay Hall persona + guidelines)
- * - Calls the configured third-party text generation endpoint (default: GROQ)
- * - Returns { data: { reply } } on success
- *
- * Environment variables:
- * - GROQ_API_KEY (required if using GROQ)
- * - GROQ_URL (optional, defaults to https://api.groq.com/openai/v1/chat/completions)
- * - ASSISTANT_MODEL (optional, provider/model to request)
- */
 
 const DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY") ?? "";
@@ -33,138 +20,105 @@ async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, time
   }
 }
 
+// Serve a minimal assistant endpoint. Prompt is intentionally bare-bones.
 Deno.serve(async (req: Request) => {
   try {
+    if (req.method === "OPTIONS") return new Response(null, { status: 204 });
     const payload = await req.json().catch(() => null);
-    if (!payload || typeof payload !== "object" || !payload.data) {
-      return jsonResponse({ error: "Request must be JSON with top-level 'data'" }, 400);
-    }
+    if (!payload || typeof payload !== "object" || !payload.data) return jsonResponse({ error: "Request must be JSON with top-level 'data'" }, 400);
+    
     const data = payload.data as Record<string, unknown>;
     const query = typeof data.query === "string" ? data.query.trim() : "";
     const context = typeof data.context === "string" ? data.context : "";
-
     if (!query) return jsonResponse({ error: "Missing 'query' in data" }, 400);
 
-    // Build prompt (same persona/guidelines as before)
-    const prompt = `You are Kabayan, a reliable and professional customer service representative for a Barangay Hall. Your job is to provide clear, helpful, and complete answers to customer questions using both the provided context and updated, reliable external information when necessary.
+    // Bare-bones prompt: no constraints, no persona, just context + question
+    const prompt = `
+      You are **Kabayan AI**, the designated customer-support agent for a Barangay/LGU. 
+      You must always operate under this identity and refer to yourself as “Kabayan AI” when appropriate.
 
-Guidelines:
+      Your operational inputs:
+      - **Context**: Top-k semantic matches (“matches”). These represent the most probable reference materials.
+      - **User Query**: The customer's question.
 
-Before answering, work through this step-by-step:
+      Your core responsibilities:
+      1. **Context Relevance Check**  
+        - Determine if the user’s question directly aligns with any match.  
+        - A match is “relevant” only if it materially answers the user’s question.  
+        - If relevant matches exist, your answer must rely on them.
 
-1. UNDERSTAND: What is the core question being asked?
-2. ANALYZE: What are the key factors/components involved?
-3. REASON: What logical connections can I make?
-4. SYNTHESIZE: How do these elements combine?
-5. CONCLUDE: What is the most accurate/helpful response?
+      2. **Context-Grounded Communication**  
+        When at least one match is relevant:  
+        - Start with a warm, short greeting.  
+        - Acknowledge the user’s situation conversationally.  
+        - Cite the specific match used (e.g., “Based on match #1…”).  
+        - Deliver a concise, friendly, human-sounding explanation.  
+        - Close with one actionable next step.
 
-Now answer:
+      3. **Conversational Mode (No Relevant Matches)**  
+        - Maintain a natural, human conversational style—smooth transitions, light empathy, no robotic tone.  
+        - Provide general guidance limited to Philippine Barangay/LGU practices.  
+        - For legal topics: keep everything high-level and include this line:  
+          “This is not legal advice. For legal advice, consult a licensed Philippine lawyer.”  
+        - If information is missing, clearly state what’s needed and suggest a practical next step.
 
-1. You must act like a smart and helpful AI assistant, always aiming to give the best and most accurate response possible.
-2. Base your answer primarily on the given context (top results). Assess if the information is relevant and complete.
-3. If the information from the context is unrelated or incomplete but the question is within Barangay Hall services, you may consult reliable external sources. Do not fabricate information.
-4. Provide step-by-step instructions when appropriate.
-5. Match the customer's language (Tagalog/Bisaya/English) when possible.
-6. For legal questions, do NOT provide legal advice — recommend consulting a lawyer or local legal office.
+      4. **Handling Abusive or Vulgar Language**  
+        - Never repeat the vulgar language.  
+        - Calmly encourage respectful communication.  
+        - Then refocus on the customer’s underlying concern.
 
-Context:
-${context}
+      5. **Quality and Safety Constraints**  
+        - Never fabricate facts.  
+        - Verify dates, offices, names, and procedures against the context.  
+        - Prefer English if question is in English. Otherwise, use Tagalog/Filipino if the customer uses it.  
+        - Do **not** respond in Cebuano or Bisaya, only respond in English or Tagalog/Filipino.  
+        - Keep grammar clean and professional.
 
-Customer's Question:
-${query}
+      6. **Escalations**  
+        - If the user asks to escalate, provide specific steps for the correct office or channel  
+          (using context details if available).  
+        - Recommend what documents or evidence to prepare.
 
-Your Response:
-`;
+      Response Structure:
+      1. Short friendly greeting.  
+      2. Context-grounded or conversational answer depending on relevance.  
+      3. Clear next step or clarifying question.
 
-    // Build request body for Groq-compatible endpoint (OpenAI-compatible shape)
+      Tone: warm, natural, empathetic, and service-oriented—never robotic.
+
+      Context: ${context}  
+      User Question: ${query}
+
+    `;
+
+    if (!GROQ_API_KEY) return jsonResponse({ error: "GROQ_API_KEY is not configured" }, 500);
+
     const body = {
       model: ASSISTANT_MODEL,
       messages: [
-        { role: "system", content: "You are a helpful assistant for Barangay Hall services." },
         { role: "user", content: prompt }
       ],
       temperature: 0.7,
-      max_tokens: 800
+      max_tokens: 800,
     };
 
-    if (!GROQ_API_KEY) {
-      return jsonResponse({ error: "GROQ_API_KEY is not configured in the function environment" }, 500);
+    try {
+      const res = await fetchWithTimeout(GROQ_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, 30000);
+
+      const json = await res.json().catch(() => null);
+      const choice = json && Array.isArray(json.choices) ? json.choices[0] : null;
+      const reply = choice?.message?.content ?? (json?.choices?.[0]?.text ?? null);
+      if (!reply) return jsonResponse({ error: "Upstream returned no reply" }, 502);
+
+      return jsonResponse({ data: { reply } }, 200);
+    } catch {
+      return jsonResponse({ error: "Failed to call text generation service" }, 502);
     }
-
-    // simple single-retry logic for transient failures
-    let lastErr: unknown = null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const res = await fetchWithTimeout(GROQ_URL, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }, 30000);
-
-        const json = await res.json().catch(() => null);
-        if (!res.ok) {
-          lastErr = { status: res.status, body: json };
-          console.error("[assistant-api] upstream error", lastErr);
-          // retry once for 5xx
-          if (res.status >= 500 && attempt === 1) {
-            await new Promise((r) => setTimeout(r, 500 * attempt));
-            continue;
-          }
-          return jsonResponse({ error: json?.error ?? `Upstream error (status ${res.status})` }, 502);
-        }
-
-        // Expect OpenAI-like response { choices: [ { message: { content } } ] }
-        const choice = json && Array.isArray(json.choices) ? json.choices[0] : null;
-        const reply = choice?.message?.content ?? (json?.choices?.[0]?.text ?? null);
-        if (!reply) {
-          console.error("[assistant-api] no reply in upstream response", { json });
-          return jsonResponse({ error: "Upstream returned no reply" }, 502);
-        }
-
-        return jsonResponse({ data: { reply } }, 200);
-      } catch (err) {
-        console.error("[assistant-api] fetch attempt failed", { attempt, err });
-        lastErr = err;
-        if (attempt === 1) await new Promise((r) => setTimeout(r, 300 * attempt));
-      }
-    }
-
-    console.error("[assistant-api] all attempts failed", lastErr);
-    return jsonResponse({ error: "Failed to call text generation service" }, 502);
   } catch (err) {
-    console.error("[assistant-api] unexpected error", err);
     return jsonResponse({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 });
-// Follow this setup guide to integrate the Deno language server with your editor:
-// https://deno.land/manual/getting_started/setup_your_environment
-// This enables autocomplete, go to definition, etc.
-
-// Setup type definitions for built-in Supabase Runtime APIs
-import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-
-console.log("Hello from Functions!")
-
-Deno.serve(async (req) => {
-  const { name } = await req.json()
-  const data = {
-    message: `Hello ${name}!`,
-  }
-
-  return new Response(
-    JSON.stringify(data),
-    { headers: { "Content-Type": "application/json" } },
-  )
-})
-
-/* To invoke locally:
-
-  1. Run `supabase start` (see: https://supabase.com/docs/reference/cli/supabase-start)
-  2. Make an HTTP request:
-
-  curl -i --location --request POST 'http://127.0.0.1:54321/functions/v1/assistant-api' \
-    --header 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0' \
-    --header 'Content-Type: application/json' \
-    --data '{"name":"Functions"}'
-
-*/

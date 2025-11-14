@@ -27,6 +27,14 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 type SheetRow = { question?: string; answer?: string; [k: string]: unknown };
 
+// Canonical embedding type
+type Embedding = number[];
+
+// Config
+const EMB_BATCH_SIZE = Number(Deno.env.get("EMB_BATCH_SIZE") ?? "32");
+const EMB_RETRIES = Number(Deno.env.get("EMB_RETRIES") ?? "2");
+const EMB_RETRY_BACKOFF_MS = Number(Deno.env.get("EMB_RETRY_BACKOFF_MS") ?? "300");
+
 const HF_URL = Deno.env.get("HF_URL") ?? "";
 const HF_KEY = Deno.env.get("HF_KEY") ?? "";
 
@@ -249,9 +257,66 @@ function getProvider(): EmbeddingProvider {
 }
 
 // call selected provider
-function callEmbeddingService(inputs: string[]): Promise<unknown[]> {
+async function callEmbeddingService(inputs: string[]): Promise<Embedding[]> {
   const provider = getProvider();
-  return provider.getEmbeddings(inputs);
+
+  // chunk inputs to avoid huge requests
+  const chunks: string[][] = [];
+  for (let i = 0; i < inputs.length; i += EMB_BATCH_SIZE) chunks.push(inputs.slice(i, i + EMB_BATCH_SIZE));
+
+  const out: Embedding[] = [];
+
+  for (const chunk of chunks) {
+    let attempt = 0;
+    let raw: unknown[] | null = null;
+    while (attempt <= EMB_RETRIES) {
+      try {
+        const resp = await provider.getEmbeddings(chunk);
+        raw = Array.isArray(resp) ? resp : (resp as unknown[]);
+        break;
+      } catch (err) {
+        attempt++;
+        console.warn(`[embedding-api] provider ${provider.name} chunk failed (attempt ${attempt}):`, err instanceof Error ? err.message : String(err));
+        if (attempt > EMB_RETRIES) throw err;
+        await new Promise((r) => setTimeout(r, EMB_RETRY_BACKOFF_MS * attempt));
+      }
+    }
+
+    if (!raw) throw new Error("No embeddings returned from provider");
+
+    // normalize each raw embedding into Embedding
+    for (const r of raw) {
+      const e = normalizeEmbedding(r);
+      if (!e) throw new Error("Provider returned invalid embedding shape");
+      out.push(e);
+    }
+  }
+
+  return out;
+}
+
+// Normalize various provider embedding shapes into flat number[]
+function normalizeEmbedding(raw: unknown): Embedding | null {
+  // if string -> try parse
+  if (typeof raw === "string") {
+    try { raw = JSON.parse(raw); } catch { /* keep as-is */ }
+  }
+  // if object with embedding field
+  if (raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).embedding)) {
+    raw = (raw as Record<string, unknown>).embedding;
+  }
+  // if nested like [[...]] -> unwrap
+  if (Array.isArray(raw) && Array.isArray((raw as unknown[])[0])) {
+    raw = (raw as unknown[])[0];
+  }
+  if (!Array.isArray(raw)) return null;
+  const vec: number[] = [];
+  for (const v of raw as unknown[]) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    vec.push(n);
+  }
+  return vec;
 }
 
 // Main handler
@@ -285,8 +350,8 @@ Deno.serve(async (req: Request) => {
 
       if (inputs.length === 0) return badRequest("No valid rows with both question and answer found in sheet");
 
-      // call embedding service once for all inputs
-      let embeddings: unknown[];
+      // call embedding service once for all inputs (returns Embedding[])
+      let embeddings: Embedding[];
       try {
         embeddings = await callEmbeddingService(inputs);
       } catch (err: unknown) {
@@ -294,8 +359,8 @@ Deno.serve(async (req: Request) => {
         return upstreamError(msg);
       }
 
-      // map embeddings back to rows
-      const results = meta.map((m, i) => ({ question: m.question, answer: m.answer, embedding: embeddings[i] ?? null, document_id: m.document_id }));
+      // map embeddings back to rows with guaranteed numeric vectors
+      const results = meta.map((m, i) => ({ question: m.question, answer: m.answer, embedding: embeddings[i], document_id: m.document_id }));
       return jsonResponse({ data: results }, 200);
     }
 
@@ -303,15 +368,15 @@ Deno.serve(async (req: Request) => {
     if (typeof data === "object" && typeof data.question === "string") {
       const q = data.question.trim();
       if (!q) return badRequest("Question cannot be empty");
-      let embeddings: unknown[];
+      let embeddings: Embedding[];
       try {
         embeddings = await callEmbeddingService([q]);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return upstreamError(msg);
       }
-      // return single embedding (keep compatibility with previous shape)
-      return jsonResponse({ data: embeddings }, 200);
+      // return single embedding as a flat numeric vector
+      return jsonResponse({ data: embeddings[0] }, 200);
     }
 
     return badRequest("Unsupported payload. Provide 'data.sheet' (array) or 'data.question' (string)");
