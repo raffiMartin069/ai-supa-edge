@@ -5,9 +5,31 @@ const DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY") ?? "";
 const GROQ_URL = Deno.env.get("GROQ_URL") ?? DEFAULT_GROQ_URL;
 const ASSISTANT_MODEL = Deno.env.get("LLMA_THREE_MODEL") ?? Deno.env.get("QWEN_THREEB_MODEL");
+const _GEMINI_MODEL = Deno.env.get("GEMINI_MODEL");
+const _GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+// (no local normalization here; assistant-api returns GROQ responses as-is but forces English)
+
+// Simple relevance heuristic: check overlap of words between query and context.
+function isContextRelevant(query: string, context: string): boolean {
+  try {
+    if (!context || context.trim().length < 20) return false;
+    const q = query.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+    const c = context.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+    const setC = new Set(c);
+    let matches = 0;
+    for (const w of q) {
+      if (setC.has(w)) matches++;
+    }
+    return matches >= Math.min(3, Math.max(1, Math.floor(q.length / 4)));
+  } catch {
+    return false;
+  }
+}
+
+function jsonResponse(body: unknown, status = 200, extraHeaders?: Record<string, string>) {
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...(extraHeaders ?? {}) };
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, timeoutMs = 20000) {
@@ -31,8 +53,13 @@ Deno.serve(async (req: Request) => {
     const query = typeof data.query === "string" ? data.query.trim() : "";
     const context = typeof data.context === "string" ? data.context : "";
     if (!query) return jsonResponse({ error: "Missing 'query' in data" }, 400);
+    console.log(`[Incoming Payload] query length: ${query.length}, context: ${context}`);
+    // Determine context relevance and build prompt.
+    const relevant = isContextRelevant(query, context);
+    const relevantStr = relevant ? "YES" : "NO";
 
     // Bare-bones prompt: no constraints, no persona, just context + question
+    // Note: assistant-api responds ONLY in English.
     const prompt = `
       You are "Kabayan AI", the friendly and professional customer service assistant for Barangay Sto. Niño (Cebu). Always be polite, straightforward, and conversational.
 
@@ -53,13 +80,7 @@ Deno.serve(async (req: Request) => {
       8. If user requests escalation, provide the appropriate procedural next step and advise what documents or evidence to prepare.
       9. Tone: warm, empathetic, helpful, and professional. Avoid robotic phrasing.
 
-      Language preference and Cebuano optimization:
-      - Reply in the user's language when clearly indicated; prefer Cebuano (Bisaya) for Cebu users, otherwise Tagalog/Filipino, then English.
-      - When replying in Cebuano, prefer natural Cebuano phrasing and particles (e.g., use "nga", "sa", natural word order). Keep sentences short and clear.
-      - Example Cebuano phrasing guide (use these styles when answering in Cebuano):
-        - Greeting: "Maayong adlaw!" or "Maayong buntag!" / "Maayong hapon!"
-        - Offer help: "Unsaon nako pagtabang nimo?" or "Puwede ba nimo i-detalye ang problema?"
-        - Next step: "Palihug dad-a ang inyong valid ID ug kopya sa..." / "Mas maayo nga moadto ka sa Barangay Hall aron..."
+      NOTE: Respond ONLY in English regardless of user's language.
 
       Response structure (must follow):
       - Short friendly greeting (unless the user said "no greeting").
@@ -70,6 +91,7 @@ Deno.serve(async (req: Request) => {
 
       Tone: warm, natural, empathetic, and service-oriented—never robotic.
 
+      Context relevance: ${relevantStr}
       Context: ${context}  
       User Question: ${query}
 
@@ -86,21 +108,37 @@ Deno.serve(async (req: Request) => {
       max_tokens: 800,
     };
 
+    // If Gemini configured, try it first (dynamic npm import). If it fails,
+    // fall back to GROQ-compatible endpoint.
+    // This endpoint is GROQ-only. We'll still record geminiDebug as null for meta.
+    const geminiDebug: string | null = null;
+
     try {
+      console.log(`Using GROQ endpoint: ${GROQ_URL} with model ${ASSISTANT_MODEL}`);
+      const groqReqPreview = JSON.stringify(body).slice(0, 2000);
+      console.log("GROQ request body (truncated):", groqReqPreview.length ? groqReqPreview : "<empty>");
       const res = await fetchWithTimeout(GROQ_URL, {
         method: "POST",
         headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }, 30000);
 
+      // log groq response headers
+      try {
+        const hdrs: Record<string, string> = {};
+        for (const [k, v] of (res.headers as Headers).entries()) hdrs[k] = v;
+        console.log("GROQ response headers:", JSON.stringify(hdrs).slice(0, 1000));
+      } catch { /* ignore */ }
+
       const json = await res.json().catch(() => null);
       const choice = json && Array.isArray(json.choices) ? json.choices[0] : null;
       const reply = choice?.message?.content ?? (json?.choices?.[0]?.text ?? null);
-      if (!reply) return jsonResponse({ error: "Upstream returned no reply" }, 502);
+      if (!reply) return jsonResponse({ error: "Upstream returned no reply", meta: { modelUsed: "groq", modelId: ASSISTANT_MODEL ?? "unknown", geminiDebug } }, 502, { "X-Model-Used": "groq", "X-Model-Id": ASSISTANT_MODEL ?? "unknown" });
 
-      return jsonResponse({ data: { reply } }, 200);
-    } catch {
-      return jsonResponse({ error: "Failed to call text generation service" }, 502);
+      return jsonResponse({ data: { reply }, meta: { modelUsed: "groq", modelId: ASSISTANT_MODEL ?? "unknown", geminiDebug } }, 200, { "X-Model-Used": "groq", "X-Model-Id": ASSISTANT_MODEL ?? "unknown" });
+    } catch (err) {
+      console.error("GROQ call failed:", err);
+      return jsonResponse({ error: "Failed to call text generation service", meta: { modelUsed: "groq", modelId: ASSISTANT_MODEL ?? "unknown", geminiDebug } }, 502);
     }
   } catch (err) {
     return jsonResponse({ error: err instanceof Error ? err.message : String(err) }, 500);

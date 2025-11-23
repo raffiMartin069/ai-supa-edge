@@ -173,25 +173,58 @@ Deno.serve(async (req: Request) => {
 			truncatedContext = (lastSpace > 0 ? cut.slice(0, lastSpace) : cut) + "...";
 		}
 
-		// 3) Forward query+context to assistant-api function
-		console.info("[chat-api] calling assistant-api", { matches: matchRows.length, contextLength: context.length });
-		const { data: assistantResp, error: assistantErr } = await supabase.functions.invoke("assistant-api", { body: { data: { query, context: truncatedContext, matches: matchRows } } });
-		if (assistantErr) {
-			console.error("[chat-api] assistant-api invoke error", assistantErr);
-			return new Response(JSON.stringify({ error: "Assistant service failed" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
-		}
-		if (!assistantResp) {
-			console.error("[chat-api] assistant-api returned no response", assistantResp);
-			return new Response(JSON.stringify({ error: "Assistant service returned no data" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+		// 3) First try Gemini-backed assistant, fall back to GROQ assistant if needed
+		console.info("[chat-api] calling gemini-assistant first", { matches: matchRows.length, contextLength: context.length });
+		let finalReply: unknown = null;
+		let geminiMeta: unknown = null;
+
+		try {
+			const { data: gemResp, error: gemErr } = await supabase.functions.invoke("gemini-assistant", { body: { data: { query, context: truncatedContext, matches: matchRows } } });
+			if (gemErr) {
+				console.error("[chat-api] gemini-assistant invoke error", gemErr);
+			} else if (!gemResp) {
+				console.warn("[chat-api] gemini-assistant returned no response", gemResp);
+			} else {
+				// gemResp may be { data: { reply, meta } } or raw reply; handle both
+				const gemData = (gemResp as any).data ?? gemResp;
+				let maybeReply: unknown = null;
+				if (gemData && typeof gemData === "object") maybeReply = (gemData.reply ?? gemData);
+				else maybeReply = gemData;
+
+				if (maybeReply) {
+					finalReply = maybeReply;
+					if (gemData && typeof gemData === "object") geminiMeta = gemData.meta ?? null;
+				} else {
+					console.warn("[chat-api] gemini-assistant returned empty reply", gemResp);
+				}
+			}
+		} catch (e) {
+			console.error("[chat-api] gemini-assistant error", e);
 		}
 
-		const reply = assistantResp.data?.reply ?? assistantResp.data ?? null;
-		if (!reply) {
-			console.error("[chat-api] assistant-api returned empty reply", assistantResp);
-			return new Response(JSON.stringify({ error: "Assistant returned empty reply" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+		if (!finalReply) {
+			console.info("[chat-api] falling back to assistant-api", { matches: matchRows.length });
+			const { data: assistantResp, error: assistantErr } = await supabase.functions.invoke("assistant-api", { body: { data: { query, context: truncatedContext, matches: matchRows } } });
+			if (assistantErr) {
+				console.error("[chat-api] assistant-api invoke error", assistantErr);
+				return new Response(JSON.stringify({ error: "Assistant service failed" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+			}
+			if (!assistantResp) {
+				console.error("[chat-api] assistant-api returned no response", assistantResp);
+				return new Response(JSON.stringify({ error: "Assistant service returned no data" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+			}
+
+			finalReply = assistantResp.data?.reply ?? assistantResp.data ?? null;
+			if (!finalReply) {
+				console.error("[chat-api] assistant-api returned empty reply", assistantResp);
+				return new Response(JSON.stringify({ error: "Assistant returned empty reply" }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+			}
+		} else {
+			console.info("[chat-api] gemini-assistant succeeded", { geminiMeta });
 		}
 
-		return new Response(JSON.stringify({ reply }), { headers: { "Content-Type": "application/json", ...corsHeaders } });
+		const replyOut = typeof finalReply === "string" ? finalReply : JSON.stringify(finalReply);
+		return new Response(JSON.stringify({ reply: replyOut }), { headers: { "Content-Type": "application/json", ...corsHeaders } });
 	} catch (err: unknown) {
 		console.error("[chat-api] unexpected error", err);
 		return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } });
