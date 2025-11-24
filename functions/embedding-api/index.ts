@@ -37,6 +37,7 @@ const EMB_RETRY_BACKOFF_MS = Number(Deno.env.get("EMB_RETRY_BACKOFF_MS") ?? "300
 
 const HF_URL = Deno.env.get("HF_URL") ?? "";
 const HF_KEY = Deno.env.get("HF_KEY") ?? "";
+const EMBEDDING_DEBUG = (Deno.env.get("EMBEDDING_DEBUG") ?? "false") === "true";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -55,6 +56,21 @@ function upstreamError(msg: string) {
 function internalError(msg: string) {
   console.error("[embedding-api] internal error:", msg);
   return jsonResponse({ error: "Internal server error" }, 500);
+}
+
+// Small utility to produce a safe, truncated preview of objects for logs
+function preview(obj: unknown, maxLen = 800) {
+  try {
+    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
+    if (s.length <= maxLen) return s;
+    return s.slice(0, maxLen) + "...";
+  } catch (_e) {
+    try {
+      return String(obj).slice(0, maxLen) + "...";
+    } catch (_e2) {
+      return "[unserializable]";
+    }
+  }
 }
 
 // small helper: fetch with timeout
@@ -96,13 +112,21 @@ const HFProvider: EmbeddingProvider = {
       body: JSON.stringify(payload),
     }, 20000);
 
-  let body: unknown;
-    try {
-      body = await res.json();
-    } catch (err) {
-      console.error("[embedding-api][hf] invalid JSON from HF", err);
-      throw new Error("Invalid response from embedding service");
-    }
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch (err) {
+        console.error("[embedding-api][hf] invalid JSON from HF", err);
+        console.info("[embedding-api][hf] response preview:", preview(await res.text().catch(() => "<no-body>")));
+        throw new Error("Invalid response from embedding service");
+      }
+
+      // Log provider response preview for observability (truncated)
+      try {
+        console.info("[embedding-api][hf] provider response", { status: res.status, bodyPreview: preview(body) });
+      } catch (_e) {
+        /* ignore logging errors */
+      }
 
     if (!res.ok) {
       console.error("[embedding-api][hf] service error", { status: res.status, body });
@@ -170,7 +194,15 @@ const HTTPAdapterProvider: EmbeddingProvider = {
       body = await res.json();
     } catch (err) {
       console.error("[embedding-api][http-adapter] invalid JSON from adapter", err);
+      console.info("[embedding-api][http-adapter] response preview:", preview(await res.text().catch(() => "<no-body>")));
       throw new Error("Invalid response from adapter service");
+    }
+
+    // Log adapter response preview
+    try {
+      console.info("[embedding-api][http-adapter] provider response", { status: res.status, bodyPreview: preview(body) });
+    } catch (_e) {
+      /* ignore logging errors */
     }
 
     if (!res.ok) {
@@ -189,66 +221,8 @@ const HTTPAdapterProvider: EmbeddingProvider = {
   }
 };
 
-// OpenAI-compatible provider
-const OPENAI_URL = Deno.env.get("OPENAI_URL") ?? "https://api.openai.com/v1/embeddings";
-const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
-const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "text-embedding-3-small";
-
-const OpenAIProvider: EmbeddingProvider = {
-  name: "openai",
-  getEmbeddings: async (inputs: string[]) => {
-    if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY is not configured");
-    console.info(`[embedding-api][openai] requesting ${inputs.length} embeddings using model ${OPENAI_MODEL}`);
-
-    // OpenAI embeddings endpoint accepts `input` as string or array
-    const payload: Record<string, unknown> = { model: OPENAI_MODEL, input: inputs.length === 1 ? inputs[0] : inputs };
-
-    const res = await fetchWithTimeout(OPENAI_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    }, 20000);
-
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch (err) {
-      console.error("[embedding-api][openai] invalid JSON from OpenAI", err);
-      throw new Error("Invalid response from OpenAI");
-    }
-
-    if (!res.ok) {
-      console.error("[embedding-api][openai] OpenAI error", { status: res.status, body });
-      const errMsg = typeof body === "object" && body !== null && (body as Record<string, unknown>)["error"]
-        ? String((body as Record<string, unknown>)["error"]) : `OpenAI error (status ${res.status})`;
-      throw new Error(errMsg);
-    }
-
-    // OpenAI returns { data: [ { embedding: [...] }, ... ] }
-    const data = body && (body as Record<string, unknown>)["data"];
-    if (!Array.isArray(data) || data.length === 0) {
-      console.error("[embedding-api][openai] no embeddings returned", { body });
-      throw new Error("No embeddings returned from OpenAI");
-    }
-
-    // map to embeddings array
-    const embeddings = (data as unknown[]).map((d) => {
-      if (d && typeof d === "object" && (d as Record<string, unknown>)["embedding"]) {
-        return (d as Record<string, unknown>)["embedding"] as unknown;
-      }
-      return null;
-    });
-
-    return embeddings as unknown[];
-  }
-};
-
 // register new providers
 providers["http-adapter"] = HTTPAdapterProvider;
-providers["openai"] = OpenAIProvider;
 
 function getProvider(): EmbeddingProvider {
   const p = providers[EMBEDDING_PROVIDER];
@@ -257,6 +231,9 @@ function getProvider(): EmbeddingProvider {
 }
 
 // call selected provider
+// lastProviderMeta populated per-call to expose provider debug info
+let lastProviderMeta: Record<string, unknown> | null = null;
+
 async function callEmbeddingService(inputs: string[]): Promise<Embedding[]> {
   const provider = getProvider();
 
@@ -269,10 +246,13 @@ async function callEmbeddingService(inputs: string[]): Promise<Embedding[]> {
   for (const chunk of chunks) {
     let attempt = 0;
     let raw: unknown[] | null = null;
+    const providerResponsesPreview: string[] = [];
     while (attempt <= EMB_RETRIES) {
       try {
         const resp = await provider.getEmbeddings(chunk);
         raw = Array.isArray(resp) ? resp : (resp as unknown[]);
+        try { providerResponsesPreview.push(preview(resp)); } catch (_e) { providerResponsesPreview.push("[preview-failed]"); }
+        console.info(`[embedding-api] provider ${provider.name} success`, { chunkSize: chunk.length, returned: Array.isArray(raw) ? raw.length : 0 });
         break;
       } catch (err) {
         attempt++;
@@ -289,6 +269,13 @@ async function callEmbeddingService(inputs: string[]): Promise<Embedding[]> {
       const e = normalizeEmbedding(r);
       if (!e) throw new Error("Provider returned invalid embedding shape");
       out.push(e);
+    }
+
+    // attach metadata about provider responses for this call
+    try {
+      lastProviderMeta = { provider: provider.name, chunkIndex: lastProviderMeta && typeof lastProviderMeta.chunkIndex === 'number' ? (lastProviderMeta.chunkIndex as number) + 1 : 0, chunkCount: chunks.length, providerResponsesPreview };
+    } catch (_e) {
+      lastProviderMeta = { provider: provider.name };
     }
   }
 
@@ -323,6 +310,12 @@ function normalizeEmbedding(raw: unknown): Embedding | null {
 Deno.serve(async (req: Request) => {
   try {
     const payload = await req.json().catch(() => null);
+    const url = new URL(req.url);
+    const debugQuery = url.searchParams.get("debug") === "true";
+    const debug = debugQuery || EMBEDDING_DEBUG;
+    console.info("[embedding-api] received request", { url: req.url, debug });
+    if (debug && payload) console.info("[embedding-api] debug payload:", payload);
+
     if (!payload || typeof payload !== "object" || !payload.data) {
       return badRequest("Request must be JSON with a top-level 'data' object");
     }
@@ -361,7 +354,7 @@ Deno.serve(async (req: Request) => {
 
       // map embeddings back to rows with guaranteed numeric vectors
       const results = meta.map((m, i) => ({ question: m.question, answer: m.answer, embedding: embeddings[i], document_id: m.document_id }));
-      return jsonResponse({ data: results }, 200);
+      return jsonResponse({ data: results, meta: lastProviderMeta }, 200);
     }
 
     // Case B: single question provided
@@ -375,8 +368,8 @@ Deno.serve(async (req: Request) => {
         const msg = err instanceof Error ? err.message : String(err);
         return upstreamError(msg);
       }
-      // return single embedding as a flat numeric vector
-      return jsonResponse({ data: embeddings[0] }, 200);
+      // return single embedding as a flat numeric vector, include provider meta for debugging
+      return jsonResponse({ data: embeddings[0], meta: lastProviderMeta }, 200);
     }
 
     return badRequest("Unsupported payload. Provide 'data.sheet' (array) or 'data.question' (string)");

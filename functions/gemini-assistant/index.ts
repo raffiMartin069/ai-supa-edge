@@ -73,17 +73,6 @@ function normalizeReply(s: string): string {
   return out.trim();
 }
 
-// Simple language detection heuristic (Cebuano/Tagalog/English)
-function detectLanguage(text: string): "ceb" | "tgl" | "eng" {
-  const t = (text || "").toLowerCase();
-  // quick Cebuano signals
-  const cebuWords = ["maayong", "unsa", "palihug", "salamat", "karon", "adto"];
-  for (const w of cebuWords) if (t.includes(w)) return "ceb";
-  const tagalogWords = ["po", "opo", "ano", "paano", "kung", "salamat"];
-  for (const w of tagalogWords) if (t.includes(w)) return "tgl";
-  return "eng";
-}
-
 // Relevance heuristic (same as assistant-api)
 function isContextRelevant(query: string, context: string): boolean {
   try {
@@ -148,31 +137,30 @@ Deno.serve(async (req: Request) => {
     const context = typeof data.context === "string" ? data.context : "";
     if (!query) return jsonResponse({ error: "Missing 'query' in data" }, 400);
 
-    const lang = detectLanguage(query);
+    // const lang = detectLanguage(query);
     const relevant = isContextRelevant(query, context);
     const relevantStr = relevant ? "YES" : "NO";
 
     if (!GEMINI_MODEL || !GEMINI_API_KEY) return jsonResponse({ error: "GEMINI_MODEL or GEMINI_API_KEY not configured" }, 500);
 
-    const prompt = `You are Kabayan AI, a warm, professional customer service assistant for Barangay Sto. Niño (Cebu).
+    const prompt = `You are Kabayan AI, a warm, professional multilingual customer service assistant. 
 
-Available inputs:
-- Context: top-k search/match results (called 'context') — use these as the single source of facts.
-- User question: the customer's message.
+      Available inputs:
+      - Context: top-k search/match results (called 'context') — use these as the single source of facts.
+      - User question: the customer's message.
 
-Rules:
-1. ONLY use information from the provided Context for factual/procedural answers. Do not invent facts beyond Context.
-2. If Context is missing or not relevant, answer conversationally but do NOT provide legal advice — only high-level Philippines-specific information and include: "This is not legal advice. For legal advice, consult a licensed Philippine lawyer."
-3. Keep replies concise: short greeting (unless user asked for none), context-grounded answer, then one clear next step or clarifying question.
-4. If user is abusive and Context not relevant, do not repeat profanity; request respectful language then help.
-5. Reply in the language of the user's question (Cebuano, Tagalog, or English). Use polite/formal tone (e.g., "po", "opo" in Tagalog).
+      Rules:
+      1. ONLY use information from the provided Context for factual/procedural answers. Do not invent facts beyond Context.
+      2. If Context is missing or not relevant, answer conversationally but do NOT provide legal advice — only high-level Philippines-specific information and include: "This is not legal advice. For legal advice, consult a licensed Philippine lawyer."
+      3. Keep replies concise: short greeting (unless user asked for none), context-grounded answer, then one clear next step or clarifying question.
+      4. If user is abusive and Context not relevant, do not repeat profanity; request respectful language then help.
+      5. Reply in the language of the user's question (Cebuano, Tagalog, or English). Use polite/formal tone (e.g., "po", "opo" in Tagalog).
 
-Context relevance: ${relevantStr}
-Context: ${context}
-User Question: ${query}
-`;
+      Context relevance: ${relevantStr}
+      Context: ${context}
+      User Question: ${query}
+      `;
 
-    console.log(`Gemini-assistant: calling model ${GEMINI_MODEL} (lang=${lang})`);
     const g = await generateWithGemini(prompt);
     const geminiDebug = g.debug ?? null;
     if (!g.reply) {
