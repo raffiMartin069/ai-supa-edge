@@ -9,7 +9,7 @@ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
 const MATCH_THRESHOLD = Number(Deno.env.get("MATCH_THRESHOLD") ?? "0.75");
 const MATCH_COUNT = Number(Deno.env.get("MATCH_COUNT") ?? "3");
 const EMBEDDING_CACHE_TTL_MS = Number(Deno.env.get("EMBEDDING_CACHE_TTL_MS") ?? "300000"); // 5 minutes
-const EMBEDDING_TIMEOUT_MS = Number(Deno.env.get("EMBEDDING_TIMEOUT_MS") ?? "8000");
+const EMBEDDING_TIMEOUT_MS = Number(Deno.env.get("EMBEDDING_TIMEOUT_MS") ?? "15000");
 const RPC_TIMEOUT_MS = Number(Deno.env.get("RPC_TIMEOUT_MS") ?? "5000");
 const MAX_CONTEXT_CHARS = Number(Deno.env.get("MAX_CONTEXT_CHARS") ?? "4000");
 const ENABLE_TEXT_FALLBACK = (Deno.env.get("ENABLE_TEXT_FALLBACK") ?? "true") === "true";
